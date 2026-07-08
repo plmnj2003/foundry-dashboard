@@ -1,12 +1,25 @@
 server:
-  port: 8080
+  port: ${PORT:8080}
 
 spring:
   datasource:
-    url: jdbc:postgresql://localhost:5432/foundry_db
-    username: foundry
-    password: foundry123
+    # Railway PostgreSQL 환경변수 자동 사용 / 로컬은 localhost fallback
+    url: jdbc:postgresql://${PGHOST:localhost}:${PGPORT:5432}/${PGDATABASE:foundry_db}
+    username: ${PGUSER:foundry}
+    password: ${PGPASSWORD:foundry123}
     driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+      minimum-idle: 3
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+
+  # 앱 시작 시 schema.sql 자동 실행 (테이블 생성 + 시드 데이터)
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
 
 anthropic:
   api-key: ${ANTHROPIC_API_KEY:}
