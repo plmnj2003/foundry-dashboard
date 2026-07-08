@@ -1,0 +1,12 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/foundry_db
+    username: foundry
+    password: foundry123
+    driver-class-name: org.postgresql.Driver
+
+anthropic:
+  api-key: ${ANTHROPIC_API_KEY:}
