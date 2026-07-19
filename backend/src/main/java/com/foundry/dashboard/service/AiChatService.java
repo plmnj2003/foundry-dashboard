@@ -5,11 +5,16 @@ import com.anthropic.client.okhttp.AnthropicOkHttpClient;
 import com.anthropic.models.messages.Message;
 import com.anthropic.models.messages.MessageCreateParams;
 import com.anthropic.models.messages.Model;
+import com.foundry.dashboard.dto.ChatResponse;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClient;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -34,24 +39,55 @@ public class AiChatService {
 
     private final JdbcTemplate jdbc;
     private final AnthropicClient anthropic;
+    private final RestClient ragClient;
 
-    public AiChatService(JdbcTemplate jdbc, @Value("${anthropic.api-key}") String apiKey) {
+    public AiChatService(JdbcTemplate jdbc,
+                          @Value("${anthropic.api-key}") String apiKey,
+                          @Value("${rag.service.base-url}") String ragServiceBaseUrl) {
         this.jdbc = jdbc;
         this.anthropic = AnthropicOkHttpClient.builder().apiKey(apiKey).build();
+        this.ragClient = RestClient.builder().baseUrl(ragServiceBaseUrl).build();
     }
 
+    /** 기존 단순 채팅 엔드포인트(/api/chat) 하위 호환용. */
     public String answer(String question) {
+        return answerStructured(question).answer();
+    }
+
+    public ChatResponse answerStructured(String question) {
         try {
-            String sql = generateSql(question);
-            validate(sql);
-            String safeSql = enforceLimitClause(sql);
-            List<Map<String, Object>> rows = jdbc.queryForList(safeSql);
-            return summarize(question, safeSql, rows);
+            String intent = classifyIntent(question);
+            return "DOCUMENT".equals(intent) ? answerFromDocuments(question) : answerFromSql(question);
         } catch (IllegalArgumentException e) {
-            return "이 쿼리는 실행할 수 없습니다: " + e.getMessage();
+            return new ChatResponse("이 쿼리는 실행할 수 없습니다: " + e.getMessage(), "sql", List.of(), 0.0);
         } catch (Exception e) {
-            return "오류: " + e.getMessage();
+            return new ChatResponse("오류: " + e.getMessage(), "error", List.of(), 0.0);
         }
+    }
+
+    private String classifyIntent(String question) {
+        String prompt = "다음 질문을 분류하세요. 매출/생산/고객/불량 등 정형 데이터베이스 조회가 필요한 질문이면 SQL, "
+            + "사내 규정·매뉴얼 같은 문서 내용을 찾아야 하는 질문이면 DOCUMENT 라고, 다른 말 없이 한 단어로만 답하세요.\n"
+            + "질문: " + question;
+        Message msg = anthropic.messages().create(
+            MessageCreateParams.builder()
+                .model(Model.CLAUDE_SONNET_4_6)
+                .maxTokens(10L)
+                .addUserMessage(prompt)
+                .build());
+        String raw = extractText(msg);
+        return raw.toUpperCase(Locale.ROOT).contains("DOCUMENT") ? "DOCUMENT" : "SQL";
+    }
+
+    // ── SQL (NL2SQL) 경로 ────────────────────────────────────────────────
+
+    private ChatResponse answerFromSql(String question) {
+        String sql = generateSql(question);
+        validate(sql);
+        String safeSql = enforceLimitClause(sql);
+        List<Map<String, Object>> rows = jdbc.queryForList(safeSql);
+        String summary = summarize(question, safeSql, rows);
+        return new ChatResponse(summary, "sql", List.of(), rows.isEmpty() ? 0.5 : 1.0);
     }
 
     private String generateSql(String question) {
@@ -62,11 +98,7 @@ public class AiChatService {
                 .maxTokens(512L)
                 .addUserMessage(prompt)
                 .build());
-        String raw = msg.content().stream()
-            .flatMap(b -> b.text().stream())
-            .map(t -> t.text().trim())
-            .collect(Collectors.joining());
-        // Strip markdown code fences
+        String raw = extractText(msg);
         return raw.replaceAll("(?s)^```[a-zA-Z]*\\s*", "").replaceAll("(?s)```\\s*$", "").trim();
     }
 
@@ -98,6 +130,56 @@ public class AiChatService {
                 .maxTokens(512L)
                 .addUserMessage(prompt)
                 .build());
+        return extractText(msg);
+    }
+
+    // ── 문서 RAG 경로 ────────────────────────────────────────────────────
+
+    private ChatResponse answerFromDocuments(String question) {
+        List<Map<String, Object>> results = searchDocuments(question);
+        if (results.isEmpty()) {
+            return new ChatResponse("관련된 사내 문서를 찾지 못했습니다.", "document", List.of(), 0.0);
+        }
+
+        String context = results.stream()
+            .map(r -> "[" + r.get("filename") + " #" + r.get("chunkIndex") + "]\n" + r.get("content"))
+            .collect(Collectors.joining("\n\n---\n\n"));
+        String prompt = "다음은 사내 문서에서 검색된 내용입니다. 이 내용만 근거로 질문에 답하고, "
+            + "근거가 없는 내용은 추측하지 말고 모른다고 답하세요.\n\n" + context + "\n\n질문: " + question;
+        Message msg = anthropic.messages().create(
+            MessageCreateParams.builder()
+                .model(Model.CLAUDE_SONNET_4_6)
+                .maxTokens(768L)
+                .addUserMessage(prompt)
+                .build());
+
+        List<ChatResponse.Source> sources = results.stream()
+            .map(r -> new ChatResponse.Source(
+                String.valueOf(r.get("filename")),
+                ((Number) r.get("chunkIndex")).intValue(),
+                Math.round(((Number) r.get("similarity")).doubleValue() * 1000) / 1000.0))
+            .toList();
+        double confidence = sources.stream().mapToDouble(ChatResponse.Source::similarity).max().orElse(0.0);
+
+        return new ChatResponse(extractText(msg), "document", sources, confidence);
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> searchDocuments(String question) {
+        try {
+            List<Map<String, Object>> results = ragClient.post()
+                .uri("/api/documents/search")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("query", question))
+                .retrieve()
+                .body(new ParameterizedTypeReference<List<Map<String, Object>>>() {});
+            return results != null ? results : List.of();
+        } catch (Exception e) {
+            throw new RuntimeException("문서 검색 서비스 호출 실패: " + e.getMessage(), e);
+        }
+    }
+
+    private String extractText(Message msg) {
         return msg.content().stream()
             .flatMap(b -> b.text().stream())
             .map(t -> t.text().trim())

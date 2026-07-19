@@ -1,7 +1,7 @@
 # PostgreSQL 상세 세팅 가이드
 
 **대상 시스템**: 반도체 파운드리 운영 대시보드  
-**작성일**: 2026-07-07  
+**작성일**: 2026-07-07 (2026-07-19 pgvector/RAG 확장 반영)  
 **적용 버전**: PostgreSQL 16 (14 이상 호환)
 
 ---
@@ -18,6 +18,7 @@
 8. [백업 및 복구](#8-백업-및-복구)
 9. [모니터링 쿼리 모음](#9-모니터링-쿼리)
 10. [기존 운영 DB 연동 패턴](#10-기존-운영-db-연동)
+11. [pgvector 확장 설치 및 RAG 테이블 (RAG 확장, 신규)](#11-pgvector-확장-설치)
 
 ---
 
@@ -989,6 +990,109 @@ CREATE FOREIGN TABLE mes_wip_remote (
 
 -- 이후 로컬 테이블처럼 조회 가능
 SELECT * FROM mes_wip_remote WHERE status_cd = 'C' LIMIT 10;
+```
+
+---
+
+## 11. pgvector 확장 설치
+
+**(RAG 확장, 2026-07-19 추가)** 사내 문서 검색(RAG)용 `rag-service` 모듈이 사용하는 벡터 유사도 검색 확장입니다.
+기존 5개 테이블과는 무관하며, 같은 `foundry_db`에 테이블 2개(`document_meta`, `document_chunks`)만 추가됩니다.
+
+### 11.1 설치 (OS별)
+
+```bash
+# ── Docker (권장, 가장 간단) ─────────────────────────────────
+# docker-compose.yml의 db 이미지를 pgvector가 포함된 이미지로 지정하면 끝
+# image: pgvector/pgvector:pg16
+
+# ── macOS (Homebrew) ─────────────────────────────────────────
+brew install pgvector
+# ⚠️ 주의: Homebrew의 pgvector 바틀은 최신 1~2개 PostgreSQL 버전(예: @17, @18)만
+#          사전 빌드해서 배포합니다. postgresql@16처럼 조금 이전 버전을 쓰고 있다면
+#          brew install만으로는 "extension \"vector\" is not available" 오류가 납니다.
+brew list --versions pgvector   # 어떤 PG 버전용으로 설치됐는지 확인
+find $(brew --prefix pgvector)/share -name "vector.control"  # postgresql@16 폴더가 없다면 아래로
+
+# postgresql@16용으로 소스에서 직접 빌드 (Xcode Command Line Tools 필요)
+git clone --branch v0.8.0 --depth 1 https://github.com/pgvector/pgvector.git
+cd pgvector
+make PG_CONFIG=$(brew --prefix postgresql@16)/bin/pg_config
+make PG_CONFIG=$(brew --prefix postgresql@16)/bin/pg_config install
+
+# ── Ubuntu / Debian ──────────────────────────────────────────
+sudo apt install postgresql-16-pgvector
+
+# ── RHEL / Rocky Linux ───────────────────────────────────────
+sudo dnf install pgvector_16
+```
+
+### 11.2 설치 확인 및 확장 활성화
+
+```sql
+-- foundry_db에 접속한 상태로
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- 버전 확인
+SELECT extversion FROM pg_extension WHERE extname = 'vector';
+```
+
+### 11.3 문서 테이블 DDL
+
+```sql
+CREATE TABLE document_meta (
+    id           SERIAL       PRIMARY KEY,
+    filename     VARCHAR(255) NOT NULL,
+    content_type VARCHAR(100),
+    file_size    BIGINT,
+    chunk_count  INTEGER      DEFAULT 0,
+    status       VARCHAR(20)  CHECK (status IN ('PROCESSING','COMPLETED','FAILED'))
+                              DEFAULT 'PROCESSING',
+    uploaded_at  TIMESTAMP    DEFAULT NOW()
+);
+
+CREATE TABLE document_chunks (
+    id          SERIAL       PRIMARY KEY,
+    document_id INTEGER      REFERENCES document_meta(id) ON DELETE CASCADE,
+    chunk_index INTEGER      NOT NULL,
+    content     TEXT         NOT NULL,
+    embedding   vector(1536),
+    created_at  TIMESTAMP    DEFAULT NOW()
+);
+
+-- 데모 규모(lists=10)용 인덱스. 데이터가 많아지면 lists ≈ sqrt(행 수)로 재계산 후 REINDEX 권장
+CREATE INDEX idx_document_chunks_embedding
+    ON document_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 10);
+
+CREATE INDEX idx_document_chunks_document_id ON document_chunks(document_id);
+```
+
+이 DDL은 `rag-service/src/main/resources/schema.sql`에 있으며, rag-service가 기동할 때마다
+`CREATE ... IF NOT EXISTS` 방식으로 자동 실행됩니다 — 수동 적용은 선택 사항입니다.
+
+### 11.4 유사도 검색 쿼리 예시
+
+```sql
+-- ? 자리에는 애플리케이션이 생성한 1536차원 벡터를 '[0.01,-0.02,...]' 형태 문자열로 바인딩
+SELECT dc.document_id, dm.filename, dc.chunk_index, dc.content,
+       1 - (dc.embedding <=> ?::vector) AS similarity   -- 코사인 유사도 (1에 가까울수록 유사)
+FROM document_chunks dc
+JOIN document_meta dm ON dc.document_id = dm.id
+WHERE dm.status = 'COMPLETED'
+ORDER BY dc.embedding <=> ?::vector   -- <=> : 코사인 거리, ivfflat 인덱스와 동일 연산자 사용
+LIMIT 5;
+```
+
+### 11.5 rag-service 전용 계정 (운영 반영 시 권장)
+
+```sql
+-- foundry_app(기존, SELECT 전용)과 분리해 문서 업로드/삭제 권한만 별도 부여
+CREATE ROLE foundry_rag WITH LOGIN PASSWORD '변경필수' CONNECTION LIMIT 5;
+GRANT CONNECT ON DATABASE foundry_db TO foundry_rag;
+GRANT USAGE ON SCHEMA public TO foundry_rag;
+GRANT SELECT, INSERT, UPDATE, DELETE ON document_meta, document_chunks TO foundry_rag;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO foundry_rag;
+-- 기존 5개 업무 테이블에는 권한을 주지 않아, rag-service가 매출/생산 데이터에 접근할 수 없도록 분리
 ```
 
 ---

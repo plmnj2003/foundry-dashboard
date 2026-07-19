@@ -23,3 +23,7 @@ spring:
 
 anthropic:
   api-key: ${ANTHROPIC_API_KEY:}
+
+rag:
+  service:
+    base-url: ${RAG_SERVICE_URL:http://localhost:8081}

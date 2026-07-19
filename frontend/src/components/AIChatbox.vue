@@ -16,6 +16,18 @@
         <!-- AI 메시지: 마크다운 렌더링 -->
         <div v-else class="bubble assistant-bubble">
           <div class="md-body" v-html="renderMd(m.text)"></div>
+          <div v-if="m.sources && m.sources.length" class="sources-box">
+            <div class="sources-title">
+              출처
+              <span v-if="m.confidence != null" class="confidence-badge">신뢰도 {{ Math.round(m.confidence * 100) }}%</span>
+            </div>
+            <ul>
+              <li v-for="(s, si) in m.sources" :key="si">
+                {{ s.filename }} <span class="chunk-idx">#{{ s.chunkIndex }}</span>
+                <span class="similarity">{{ Math.round(s.similarity * 100) }}%</span>
+              </li>
+            </ul>
+          </div>
         </div>
 
       </div>
@@ -31,6 +43,10 @@
     </div>
 
     <div class="input-row">
+      <input type="file" ref="fileEl" class="file-input" @change="onFileSelected" />
+      <button class="upload-btn" title="문서 업로드 (RAG)" @click="fileEl.click()" :disabled="uploading">
+        {{ uploading ? '업로드중' : '📎' }}
+      </button>
       <input
         v-model="input"
         @keydown.enter="send"
@@ -48,7 +64,7 @@
 import { ref, nextTick } from 'vue'
 import { marked } from 'marked'
 
-const props = defineProps({ sendChat: Function })
+const props = defineProps({ sendChat: Function, uploadDocument: Function })
 
 // marked 옵션: 표·코드블록·줄바꿈 모두 처리
 marked.setOptions({ breaks: true, gfm: true })
@@ -58,13 +74,15 @@ function renderMd(text) {
   return marked.parse(text)
 }
 
-const input    = ref('')
-const thinking = ref(false)
-const msgEl    = ref(null)
+const input     = ref('')
+const thinking  = ref(false)
+const uploading = ref(false)
+const msgEl     = ref(null)
+const fileEl    = ref(null)
 const messages = ref([
   {
     role: 'assistant',
-    text: '반도체 파운드리 데이터에 대해 자유롭게 질문하세요.\n\n**예시 질문**\n- 수익이 가장 높은 고객 Top 3는?\n- 최근 CRITICAL 불량이 발생한 Lot은?\n- 제품별 평균 수율을 알려줘'
+    text: '반도체 파운드리 데이터나 사내 문서에 대해 자유롭게 질문하세요.\n\n**예시 질문**\n- 수익이 가장 높은 고객 Top 3는?\n- 최근 CRITICAL 불량이 발생한 Lot은?\n- 사내 출장 규정 요약해줘\n\n📎 버튼으로 문서를 업로드하면 해당 문서 내용도 답변에 활용됩니다.'
   }
 ])
 
@@ -77,12 +95,37 @@ async function send() {
   await nextTick()
   scroll()
   try {
-    const answer = await props.sendChat(q)
-    messages.value.push({ role: 'assistant', text: answer })
+    const res = await props.sendChat(q)
+    messages.value.push({
+      role: 'assistant',
+      text: res.answer,
+      sources: res.sources,
+      confidence: res.confidence
+    })
   } catch {
     messages.value.push({ role: 'assistant', text: '**오류**가 발생했습니다. 잠시 후 다시 시도해주세요.' })
   } finally {
     thinking.value = false
+    await nextTick()
+    scroll()
+  }
+}
+
+async function onFileSelected(e) {
+  const file = e.target.files[0]
+  e.target.value = ''
+  if (!file || uploading.value) return
+  uploading.value = true
+  try {
+    const res = await props.uploadDocument(file)
+    messages.value.push({
+      role: 'assistant',
+      text: `**${res.filename}** 문서가 업로드되어 인덱싱되었습니다. 이제 이 문서 내용에 대해 질문할 수 있습니다.`
+    })
+  } catch {
+    messages.value.push({ role: 'assistant', text: '**문서 업로드 실패**. 잠시 후 다시 시도해주세요.' })
+  } finally {
+    uploading.value = false
     await nextTick()
     scroll()
   }
@@ -259,6 +302,57 @@ function scroll() {
   color: #555;
   font-style: italic;
 }
+
+/* ── 출처 인용 박스 ──────────────────────────────────────── */
+.sources-box {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed #ddd;
+  font-size: 11px;
+}
+.sources-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  color: #888;
+  margin-bottom: 4px;
+}
+.confidence-badge {
+  font-weight: 600;
+  background: #eef2ff;
+  color: #1a1a2e;
+  border-radius: 10px;
+  padding: 1px 8px;
+}
+.sources-box ul { list-style: none; padding: 0; margin: 0; }
+.sources-box li {
+  padding: 3px 0;
+  color: #555;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sources-box .chunk-idx { color: #aaa; }
+.sources-box .similarity {
+  margin-left: auto;
+  color: #2b9348;
+  font-weight: 600;
+}
+
+/* ── 문서 업로드 버튼 ────────────────────────────────────── */
+.file-input { display: none; }
+.upload-btn {
+  padding: 12px 14px;
+  background: #fff;
+  color: #1a1a2e;
+  border: none;
+  border-right: 1px solid #eee;
+  cursor: pointer;
+  font-size: 15px;
+}
+.upload-btn:hover:not(:disabled) { background: #f0f2f5; }
+.upload-btn:disabled { opacity: .5; cursor: not-allowed; }
 
 /* ── 로딩 인디케이터 (점 3개 애니메이션) ─────────────────── */
 .thinking-bubble {

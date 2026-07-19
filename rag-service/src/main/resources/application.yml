@@ -1,0 +1,35 @@
+server:
+  port: ${RAG_SERVICE_PORT:8081}
+
+spring:
+  datasource:
+    # backend와 동일한 Postgres 인스턴스를 공유 (Railway 환경변수 자동 사용, 로컬은 localhost fallback)
+    url: jdbc:postgresql://${PGHOST:localhost}:${PGPORT:5432}/${PGDATABASE:foundry_db}
+    username: ${PGUSER:foundry}
+    password: ${PGPASSWORD:foundry123}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:5}
+      minimum-idle: 2
+      connection-timeout: 30000
+
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+
+  servlet:
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 20MB
+
+rag:
+  openai:
+    api-key: ${OPENAI_API_KEY:}
+    embedding-model: text-embedding-3-small
+    embedding-dimensions: 1536
+  chunk:
+    target-chars: 800
+    overlap-ratio: 0.1
+  search:
+    top-k: 5

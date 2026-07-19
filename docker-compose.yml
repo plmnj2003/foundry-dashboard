@@ -1,6 +1,7 @@
 services:
   db:
-    image: postgres:16-alpine
+    # pgvector 확장이 포함된 이미지 필요 (일반 postgres:16 이미지에는 vector.control이 없음)
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: foundry_db
       POSTGRES_USER: foundry
@@ -24,6 +25,24 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/foundry_db
       SPRING_DATASOURCE_USERNAME: foundry
       SPRING_DATASOURCE_PASSWORD: foundry123
+      RAG_SERVICE_URL: http://rag-service:8081
+    depends_on:
+      db:
+        condition: service_healthy
+      rag-service:
+        condition: service_started
+
+  rag-service:
+    build: ./rag-service
+    ports:
+      - "8081:8081"
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      PGHOST: db
+      PGPORT: 5432
+      PGDATABASE: foundry_db
+      PGUSER: foundry
+      PGPASSWORD: foundry123
     depends_on:
       db:
         condition: service_healthy

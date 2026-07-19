@@ -1,10 +1,18 @@
 <template>
   <div class="app">
     <header>
-      <h1>반도체 파운드리 운영 대시보드</h1>
-      <span class="subtitle">Semiconductor Foundry Operations</span>
+      <div>
+        <h1>반도체 파운드리 운영 대시보드</h1>
+        <span class="subtitle">Semiconductor Foundry Operations</span>
+      </div>
+      <button class="docs-toggle-btn" @click="showDocs = !showDocs">
+        {{ showDocs ? '← 대시보드' : '📄 문서 관리' }}
+      </button>
     </header>
 
+    <DocumentsManager v-if="showDocs" @close="showDocs = false" />
+
+    <template v-else>
     <div v-if="loading" class="loading">데이터 로딩 중...</div>
     <div v-else-if="error" class="error">백엔드 연결 오류: {{ error }}</div>
 
@@ -87,28 +95,34 @@
 
       <!-- AI Chatbox -->
       <section class="chat-section">
-        <AIChatbox :sendChat="sendChat" />
+        <AIChatbox :sendChat="sendChat" :uploadDocument="uploadDocument" />
       </section>
     </div>
+    </template>
   </div>
 </template>
 
 <script setup>
-import { onMounted, computed } from 'vue'
+import { onMounted, computed, ref } from 'vue'
 import { Line, Bar, Doughnut } from 'vue-chartjs'
 import {
   Chart as ChartJS, CategoryScale, LinearScale, PointElement,
   LineElement, BarElement, ArcElement, Tooltip, Legend, Filler
 } from 'chart.js'
 import { useDashboardAPI } from './composables/useDashboardAPI.js'
+import { useChatApi } from './composables/useChatApi.js'
 import AIChatbox from './components/AIChatbox.vue'
+import DocumentsManager from './components/DocumentsManager.vue'
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement,
   BarElement, ArcElement, Tooltip, Legend, Filler)
 
 const { kpis, revenueByCustomer, revenueTrend, yieldByProduct,
         defectsByType, productionLots, orders, loading, error,
-        fetchAll, sendChat } = useDashboardAPI()
+        fetchAll } = useDashboardAPI()
+const { sendChat, uploadDocument } = useChatApi()
+
+const showDocs = ref(false)
 
 onMounted(fetchAll)
 
@@ -165,9 +179,23 @@ const doughnutOpts = { responsive: true, plugins: { legend: { position: 'right' 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f4f5f7; color: #333; }
 .app { max-width: 1400px; margin: 0 auto; padding: 20px; }
-header { background: #1a1a2e; color: #fff; padding: 20px 24px; border-radius: 8px; margin-bottom: 20px; }
+header { background: #1a1a2e; color: #fff; padding: 20px 24px; border-radius: 8px; margin-bottom: 20px;
+  display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 header h1 { font-size: 22px; font-weight: 700; }
 header .subtitle { font-size: 13px; opacity: .7; }
+.docs-toggle-btn {
+  flex-shrink: 0;
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,.25);
+  background: rgba(255,255,255,.1);
+  color: #fff;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.docs-toggle-btn:hover { background: rgba(255,255,255,.2); }
 .loading, .error { text-align: center; padding: 60px; font-size: 16px; }
 .error { color: #e94560; }
 .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }

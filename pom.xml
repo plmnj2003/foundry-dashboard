@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.foundry</groupId>
+    <artifactId>foundry-dashboard-reactor</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>foundry-dashboard-reactor</name>
+
+    <!--
+      Aggregator only (no <parent>): backend/ and rag-service/ each keep their own
+      full Spring Boot parent chain so they still build standalone inside their
+      existing Docker build contexts (backend/Dockerfile only COPYs backend/pom.xml).
+      Run `mvn install` here to build both modules in one pass.
+    -->
+    <modules>
+        <module>backend</module>
+        <module>rag-service</module>
+    </modules>
+</project>

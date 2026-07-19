@@ -41,12 +41,7 @@ export function useDashboardAPI() {
     }
   }
 
-  async function sendChat(question) {
-    const res = await axios.post(`${BASE}/chat`, { question })
-    return res.data.answer
-  }
-
   return { kpis, revenueByCustomer, revenueTrend, yieldByProduct,
            defectsByType, productionLots, orders, loading, error,
-           fetchAll, sendChat }
+           fetchAll }
 }

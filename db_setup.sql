@@ -131,3 +131,32 @@ INSERT INTO defect_records (lot_id, defect_type, process_step, count, severity, 
 (17,'Overlay Error','Lithography',11,'MAJOR','2024-05-15 14:00:00'),
 (17,'Surface Roughness','CMP',8,'MINOR','2024-05-18 10:00:00'),
 (19,'CD Variation','Etch',3,'MINOR','2024-05-22 11:00:00');
+
+-- ── 문서 RAG (rag-service 모듈이 소유하는 테이블) ──────────────
+-- rag-service 자체 schema.sql로도 생성되지만, docker-compose로 db 컨테이너를
+-- 처음 초기화할 때부터 확장이 준비되어 있도록 여기에도 동일하게 둔다.
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS document_meta (
+    id SERIAL PRIMARY KEY,
+    filename VARCHAR(255) NOT NULL,
+    content_type VARCHAR(100),
+    file_size BIGINT,
+    chunk_count INTEGER DEFAULT 0,
+    status VARCHAR(20) CHECK (status IN ('PROCESSING','COMPLETED','FAILED')) DEFAULT 'PROCESSING',
+    uploaded_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS document_chunks (
+    id SERIAL PRIMARY KEY,
+    document_id INTEGER REFERENCES document_meta(id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    embedding vector(1536),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_chunks_embedding
+    ON document_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 10);
+
+CREATE INDEX IF NOT EXISTS idx_document_chunks_document_id ON document_chunks(document_id);

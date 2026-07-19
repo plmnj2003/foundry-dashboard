@@ -1,9 +1,14 @@
 # 반도체 파운드리 운영 대시보드 — 엔터프라이즈 적용 사양서
 
-**문서 버전**: 2.0  
-**작성일**: 2026-07-07  
+**문서 버전**: 2.1  
+**작성일**: 2026-07-07 (2026-07-19 RAG 확장 반영)  
 **적용 대상**: 기존 운영 인프라 보유 사업장  
 **문서 목적**: 샘플 환경에서 검증된 대시보드를 실운영 시스템에 연동·배포하기 위한 상세 기술 사양
+
+> **2026-07-19 업데이트**: 사내 문서 검색용 RAG 파이프라인이 `rag-service`라는 별도 Spring Boot 모듈(멀티모듈,
+> 포트 8081)로 추가되었습니다. 기존 backend(8080)·PostgreSQL 5개 테이블·NL2SQL 가드레일은 변경되지 않았습니다.
+> 관련 내용은 2.1, 3.10, 5.3, 6.4에 "(RAG 확장)" 표시로 추가했습니다. 운영(Railway) 배포에는 아직 rag-service가
+> 반영되지 않았습니다 — 8.5절 참고.
 
 ---
 
@@ -137,6 +142,41 @@
 ```
 
 **권장**: 초기 도입 시 **Option B (ETL 배치)** → 안정화 후 Option A 또는 C로 전환
+
+### 2.3 (RAG 확장) rag-service 모듈 추가 구성
+
+기존 구성(2.1)에 사내 문서 검색 전용 서비스 하나가 옆에 붙습니다. Nginx/Spring Boot API 계층은 변경되지 않고,
+Spring Boot API가 내부적으로 새 서비스를 호출하는 구조입니다.
+
+```
+┌─────────────────────────────┐        ┌──────────────────────────────────┐
+│  Spring Boot 3.2 API (기존)   │        │  rag-service (신규, Spring Boot)    │
+│  :8080                       │        │  :8081                            │
+│                              │  HTTP  │                                    │
+│  AiChatService               │───────▶│  DocumentController                │
+│   질문 분류: SQL / DOCUMENT   │◀───────│   업로드 · 목록 · 검색 · 삭제         │
+│  DocumentProxyController      │        │  DocumentIngestionService           │
+│   (업로드/목록/삭제 중계)      │        │   Tika 파싱 → 청킹(10% overlap)     │
+└───────────────┬──────────────┘        │  EmbeddingService                   │
+                │                       │   OpenAI 임베딩 (키 없으면 해싱 폴백) │
+                │                       │  VectorSearchService                │
+                │                       │   pgvector 코사인 유사도 검색         │
+                │                       └───────────────┬────────────────────┘
+                │                                       │
+                ▼                                       ▼
+      ┌───────────────────────────────────────────────────────────┐
+      │              PostgreSQL (foundry_db) — 공용                 │
+      │  기존 5개 테이블   +   document_meta / document_chunks       │
+      │                        (pgvector 확장, ivfflat 인덱스)        │
+      └───────────────────────────────────────────────────────────┘
+```
+
+**설계 원칙**:
+- rag-service는 검색(Retrieval)만 담당하고, 답변 생성(Generation)은 기존 backend의 AiChatService가 그대로
+  Claude API로 수행합니다 — RAG의 R과 G를 모듈 경계로 명확히 분리.
+- backend/pom.xml은 수정하지 않고, 루트에 aggregator `pom.xml`만 추가해 두 모듈을 묶었습니다.
+  이는 기존 `backend/Dockerfile`이 `backend/` 디렉터리만 빌드 컨텍스트로 사용하는 방식을 그대로 유지하기 위한
+  의도적 설계입니다 (parent POM 의존 관계로 만들면 기존 Docker 빌드가 깨집니다).
 
 ---
 
@@ -585,6 +625,61 @@ CREATE TABLE sales_orders_2025
 -- 매년 파티션 추가 필요 (cron 자동화 권장)
 ```
 
+### 3.10 (RAG 확장) 문서 검색용 테이블 — document_meta / document_chunks
+
+rag-service 모듈이 스키마를 소유하며, 기존 5개 테이블과 완전히 독립적입니다 (FK 없음).
+
+```sql
+-- ============================================================
+-- pgvector 확장 — 문서 임베딩 저장/검색에 필요
+-- 주의: 일반 postgres:16 이미지에는 포함되어 있지 않음.
+--       Docker는 pgvector/pgvector:pg16 이미지 사용, 로컬 설치는
+--       postgresql_setup_guide.md 11장 참고 (Homebrew pg16은 소스 빌드 필요할 수 있음)
+-- ============================================================
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- ============================================================
+-- 테이블: document_meta (업로드 문서 메타정보)
+-- ============================================================
+CREATE TABLE document_meta (
+    id           SERIAL       PRIMARY KEY,
+    filename     VARCHAR(255) NOT NULL,
+    content_type VARCHAR(100),
+    file_size    BIGINT,
+    chunk_count  INTEGER      DEFAULT 0,
+    status       VARCHAR(20)  CHECK (status IN ('PROCESSING','COMPLETED','FAILED'))
+                              DEFAULT 'PROCESSING',
+    uploaded_at  TIMESTAMP    DEFAULT NOW()
+);
+
+-- ============================================================
+-- 테이블: document_chunks (청크 본문 + 임베딩 벡터)
+-- ============================================================
+CREATE TABLE document_chunks (
+    id          SERIAL       PRIMARY KEY,
+    document_id INTEGER      REFERENCES document_meta(id) ON DELETE CASCADE,
+    chunk_index INTEGER      NOT NULL,
+    content     TEXT         NOT NULL,
+    embedding   vector(1536),                 -- OpenAI text-embedding-3-small 차원
+    created_at  TIMESTAMP    DEFAULT NOW()
+);
+
+-- 데모용 ivfflat 인덱스 (lists=10). 데이터가 수만 건 이상으로 늘어나면
+-- lists = sqrt(전체 행 수) 근사값으로 재계산 후 REINDEX 권장
+CREATE INDEX idx_document_chunks_embedding
+    ON document_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 10);
+
+CREATE INDEX idx_document_chunks_document_id ON document_chunks(document_id);
+
+COMMENT ON TABLE document_meta   IS '업로드 문서 메타정보 (RAG 확장)';
+COMMENT ON TABLE document_chunks IS '문서 청크 본문 + pgvector 임베딩 (RAG 확장)';
+COMMENT ON COLUMN document_chunks.embedding IS '코사인 거리(<=>) 기준 유사도 검색에 사용';
+```
+
+**운영 반영 시 참고**: `foundry_app`(SELECT 전용) 계정으로도 이 테이블을 조회할 수 있어야 하므로,
+3.1의 `GRANT SELECT ON ALL TABLES IN SCHEMA public` 문이 이 두 테이블에도 자동 적용됩니다.
+단, 문서 업로드/삭제(INSERT/DELETE)는 rag-service 전용 계정을 별도로 분리하는 것을 권장합니다.
+
 ---
 
 ## 4. 기존 시스템 데이터 매핑 가이드
@@ -902,6 +997,52 @@ ORDER BY total_revenue DESC
 오류 응답: { "answer": "이 쿼리는 실행할 수 없습니다: DDL 문은 허용되지 않습니다." }
 ```
 
+### 5.3 (RAG 확장) 문서 검색 API
+
+모두 backend(:8080)의 `/api/documents/**`, `/api/ai/chat`으로 노출되며, 내부적으로 rag-service(:8081)를 호출합니다.
+rag-service의 엔드포인트는 외부에 직접 노출되지 않습니다.
+
+#### POST /api/ai/chat
+
+```
+설명: AI 자연어 질의 — 질문을 SQL/문서로 자동 분류 후 처리
+요청: { "question": "사내 출장 규정 요약해줘" }
+
+응답 (문서 경로):
+{
+  "answer":     "1. 출장 신청 ... (근거 기반 답변)",
+  "type":       "document",
+  "sources":    [{ "filename": "사내_출장_규정.txt", "chunkIndex": 0, "similarity": 0.27 }],
+  "confidence": 0.27
+}
+
+응답 (SQL 경로): { "answer": "...", "type": "sql", "sources": [], "confidence": 1.0 }
+처리 시간: 분류 1회 + (SQL 2회 또는 검색 1회+생성 1회) Claude 호출 — 평균 4~12초
+```
+
+#### POST /api/documents/upload
+
+```
+설명: 문서 업로드 (multipart/form-data, key=file) → Tika 파싱 → 청킹 → 임베딩 → pgvector 저장
+제한: 20MB (application.yml multipart 설정)
+응답: { "documentId": 4, "filename": "품질관리_매뉴얼.txt", "status": "COMPLETED" }
+실패 시 document_meta.status = 'FAILED'로 기록, 5xx 응답
+```
+
+#### GET /api/documents
+
+```
+설명: 업로드된 문서 목록 (파일명·유형·크기·청크 수·상태·업로드 시각)
+정렬: id DESC (최신 업로드 우선)
+```
+
+#### DELETE /api/documents/{id}
+
+```
+설명: 문서 삭제 — document_chunks는 ON DELETE CASCADE로 함께 삭제됨
+응답: 204 No Content (성공) / 404 Not Found (존재하지 않는 id)
+```
+
 ---
 
 ## 6. AI 파이프라인 상세 명세
@@ -944,6 +1085,42 @@ SQL: {generatedSql}
 | claude-haiku-4-5 | 최저 | 보통 | 가장 빠름 | 단순 집계 질문 |
 | claude-sonnet-4-6 | 중간 | 우수 | 보통 | **현재 적용 (권장)** |
 | claude-opus-4-8 | 최고 | 최상 | 느림 | 복잡한 분석 질문 |
+
+### 6.4 (RAG 확장) 질문 분류 및 문서 인입 파이프라인
+
+**질문 분류 프롬프트** (기존 SQL 생성 프롬프트 앞 단계):
+
+```
+다음 질문을 분류하세요. 매출/생산/고객/불량 등 정형 데이터베이스 조회가 필요한 질문이면 SQL,
+사내 규정·매뉴얼 같은 문서 내용을 찾아야 하는 질문이면 DOCUMENT 라고, 다른 말 없이 한 단어로만 답하세요.
+질문: {userQuestion}
+```
+
+**문서 답변 생성 프롬프트** (검색된 청크를 근거로 사용):
+
+```
+다음은 사내 문서에서 검색된 내용입니다. 이 내용만 근거로 질문에 답하고,
+근거가 없는 내용은 추측하지 말고 모른다고 답하세요.
+
+[검색된 청크 1..N]
+질문: {userQuestion}
+```
+
+**문서 인입(업로드) 파이프라인 단계별 상세**:
+
+| 단계 | 처리 내용 | 구현 클래스 |
+|---|---|---|
+| 1. 파싱 | PDF/DOCX/TXT 등에서 순수 텍스트 추출 | Apache Tika (`org.apache.tika.Tika`) |
+| 2. 청킹 | 문단 단위로 목표 800자에 맞춰 묶고, 청크 경계마다 앞 청크 꼬리 10%를 겹쳐 문맥 단절 방지 | `TextChunker` |
+| 3. 임베딩 | 청크별로 1536차원 벡터 생성 — OpenAI API 우선, 실패/키 없으면 해싱 폴백 | `EmbeddingService` |
+| 4. 저장 | `document_chunks`에 청크 본문 + `embedding vector(1536)` 저장, `document_meta.status`를 COMPLETED로 갱신 | `DocumentIngestionService` |
+| 5. 검색 | 질문을 동일 방식으로 임베딩 → `embedding <=> ?::vector` 코사인 거리 오름차순 상위 K건 조회 | `VectorSearchService` |
+
+**임베딩 폴백 상세** (`OPENAI_API_KEY` 미설정 시):
+텍스트를 단어 단위로 나눈 뒤 각 단어를 해시하여 1536개 버킷 중 하나에 ±1로 누적하는
+bag-of-words feature hashing 방식입니다. 신경망 기반 의미 임베딩만큼 정교하진 않지만 어휘 중복 기반
+유사도는 반영되며, 결정론적이라 동일 텍스트는 항상 동일 벡터를 생성합니다 — 외부 API 없이도 검색 기능
+자체가 항상 동작하도록 하기 위한 데모 안정성 장치입니다.
 
 ---
 
@@ -1143,6 +1320,42 @@ server {
         proxy_set_header   Host $host;
     }
 }
+```
+
+### 8.5 (RAG 확장) rag-service 환경설정 및 운영 반영 현황
+
+```yaml
+# rag-service application.yml 핵심 설정
+server:
+  port: ${RAG_SERVICE_PORT:8081}
+rag:
+  openai:
+    api-key: ${OPENAI_API_KEY:}          # 없으면 해싱 폴백
+    embedding-model: text-embedding-3-small
+    embedding-dimensions: 1536
+  chunk:
+    target-chars: 800
+    overlap-ratio: 0.1
+  search:
+    top-k: 5
+
+# backend가 rag-service를 찾는 방법
+rag:
+  service:
+    base-url: ${RAG_SERVICE_URL:http://localhost:8081}
+```
+
+```
+[현재 운영 반영 상태]
+
+로컬 (docker-compose / start.sh): backend + rag-service + frontend 모두 기동 ✅
+운영 (Railway):                    backend + frontend만 배포 중, rag-service 미반영 ⚠️
+
+rag-service를 운영에 추가하려면:
+  1. Railway에 rag-service용 서비스 신규 생성 (독립 Dockerfile 이미 준비됨: rag-service/Dockerfile)
+  2. 기존 backend 서비스와 동일한 PostgreSQL 인스턴스를 가리키도록 PG* 환경변수 연결
+  3. backend 서비스에 RAG_SERVICE_URL 환경변수로 신규 서비스의 내부 주소 지정
+  4. OPENAI_API_KEY 설정 (선택 — 없으면 해싱 폴백으로 동작은 하되 검색 정확도 저하)
 ```
 
 ---
@@ -1479,6 +1692,25 @@ curl http://gpu-server.internal:8000/v1/models
   - Qwen2.5 시리즈로 교체 (한국어 강점)
   - 프롬프트에 "반드시 한국어로 답변하시오" 명시
   - 요약 프롬프트 강화
+
+[문제] (RAG 확장) "extension \"vector\" is not available" 오류
+원인: Homebrew의 postgresql@16용 pgvector 사전 빌드 바이너리가 없음
+     (Homebrew pgvector 바틀은 최신 1~2개 PostgreSQL 버전만 지원)
+해결:
+  1. brew install pgvector 만으로는 부족할 수 있음 — brew list --versions pgvector로 확인
+  2. 소스 빌드로 직접 설치:
+     git clone --branch v0.8.0 https://github.com/pgvector/pgvector.git
+     cd pgvector
+     make PG_CONFIG=$(brew --prefix postgresql@16)/bin/pg_config
+     make PG_CONFIG=$(brew --prefix postgresql@16)/bin/pg_config install
+  3. CREATE EXTENSION vector; 재시도
+  4. Docker 사용 시에는 이 문제 자체가 없음 (pgvector/pgvector:pg16 이미지 사용)
+
+[문제] (RAG 확장) 문서 질문인데 SQL 경로로 잘못 분류됨 (또는 반대)
+원인: 분류 프롬프트가 애매한 질문에서 오분류할 수 있음 (LLM 기반 분류의 한계)
+해결:
+  - 질문을 더 구체적으로 표현 (예: "규정에서" "매뉴얼에 따르면" 등 문서 힌트 포함)
+  - 재현 빈도가 높으면 AiChatService.classifyIntent()의 분류 프롬프트에 예시(few-shot) 추가
 ```
 
 ---
@@ -1502,3 +1734,9 @@ curl http://gpu-server.internal:8000/v1/models
 | KPI | Key Performance Indicator — 핵심 성과 지표 |
 | LIMS | Laboratory Information Management System — 품질 분석 시스템 |
 | AOI | Automated Optical Inspection — 자동 광학 검사 |
+| RAG (RAG 확장) | Retrieval-Augmented Generation — 관련 문서를 먼저 검색한 뒤 그 내용을 근거로 답변을 생성하는 방식 |
+| pgvector (RAG 확장) | PostgreSQL에 벡터 저장·유사도 검색 기능을 추가하는 확장(extension) |
+| 임베딩 (RAG 확장) | 텍스트의 의미를 고정 차원 숫자 벡터로 표현한 것 (본 프로젝트는 1536차원) |
+| 청킹 (RAG 확장) | 긴 문서를 검색·임베딩에 적합한 크기로 분할하는 작업 |
+| ivfflat (RAG 확장) | pgvector가 제공하는 근사 최근접 이웃(ANN) 인덱스 방식 중 하나 |
+| Feature Hashing (RAG 확장) | 단어를 해시로 고정 차원 벡터에 매핑하는 임베딩 폴백 기법 (외부 API 불필요) |
