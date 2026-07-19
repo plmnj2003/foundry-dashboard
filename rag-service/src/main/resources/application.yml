@@ -1,5 +1,6 @@
 server:
-  port: ${RAG_SERVICE_PORT:8081}
+  # Railway는 PORT 환경변수로 리스닝 포트를 주입한다 (backend와 동일한 관례)
+  port: ${PORT:${RAG_SERVICE_PORT:8081}}
 
 spring:
   datasource:
